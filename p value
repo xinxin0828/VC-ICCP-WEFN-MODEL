@@ -1,0 +1,158 @@
+%% ============================================================
+%  K–S (Matlab kstest-ECDF) p-value / h full reproduction code
+%  WA/EA/LA (n=7) × Normal / Lognormal / Weibull
+%  Outputs: D(=ksstat), p, h, D+, D-, RMSE, and explicit p-from-D
+% ============================================================
+
+clear; clc;
+
+%% 1) Raw data (2017–2023)
+WA = [81.98, 77.81, 75.30, 75.80, 75.24, 69.33, 70.63];                  % 1e8 m^3
+EA = [4688571, 4728461, 4845262, 4942958, 5007042, 5130603, 5229014];    % kWh
+LA = [5060648, 4187159, 4675308, 3742254, 3737991, 4217554, 4231911];    % mu (亩)
+
+% Scale (optional; scaling does NOT change K-S logic; only parameter units)
+EA = EA / 1e6;   % 10^6 kWh
+LA = LA / 1e6;   % 10^6 mu
+
+vars = struct();
+vars.WA = WA(:);
+vars.EA = EA(:);
+vars.LA = LA(:);
+
+alpha = 0.05;
+
+%% 2) Run all cases and print a final Table 3
+distList = {'normal','lognormal','weibull'};
+varNames  = fieldnames(vars);
+
+fprintf('============================================================\n');
+fprintf('Matlab kstest-ECDF reproduction (alpha=%.2f)\n', alpha);
+fprintf('============================================================\n');
+
+results = []; % store rows
+
+for vi = 1:numel(varNames)
+    vname = varNames{vi};
+    x = vars.(vname);
+    x = sort(x);
+    n = numel(x);
+
+    for di = 1:numel(distList)
+        dname = distList{di};
+
+        % --- Fit MLE parameters + build theoretical CDF values at sample points
+        switch lower(dname)
+            case 'normal'
+                mu    = mean(x);
+                sigma = std(x,1);               % MLE uses denominator n
+                F0    = normcdf(x, mu, sigma);
+
+            case 'lognormal'
+                y     = log(x);
+                mu_ln = mean(y);
+                sig_ln= std(y,1);               % MLE in log-domain
+                F0    = normcdf(log(x), mu_ln, sig_ln);
+
+            case 'weibull'
+                % Weibull 2-parameter MLE (shape A, scale B)
+                % wblfit returns [A,B] = [scale, shape] for "Weibull distribution".
+                % NOTE: For strict MLE consistency, use wblfit; it uses MLE by default.
+                [parmHat, ~] = wblfit(x);       % parmHat = [A(scale), B(shape)]
+                A = parmHat(1);
+                B = parmHat(2);
+                F0 = wblcdf(x, A, B);
+
+            otherwise
+                error('Unknown distribution.');
+        end
+
+        % --- 3) Matlab kstest using supplied CDF table [x F0]
+        % kstest uses ECDF step (k/n and (k-1)/n) internally and returns:
+        %   h: reject?   p: p-value    ksstat: D
+        [h, p_kstest, ksstat] = kstest(x, 'CDF', [x F0], 'Alpha', alpha);
+
+        % --- 4) Explicit D+, D-, RMSE using ECDF step definition
+        FE_right = (1:n)'/n;           % k/n
+        FE_left  = (0:n-1)'/n;         % (k-1)/n
+
+        Dplus  = max(FE_right - F0);
+        Dminus = max(F0 - FE_left);
+        D_ecdf = max(Dplus, Dminus);
+
+        RMSE = sqrt(mean((FE_right - F0).^2));
+
+        % --- 5) Explicit p from D using Kolmogorov distribution
+        % This should match p_kstest (up to tiny numerical differences)
+        p_fromD = ks_pvalue_fromD(D_ecdf, n);
+
+        % Store
+        row = {vname, dname, ksstat, p_kstest, h, Dplus, Dminus, D_ecdf, p_fromD, RMSE};
+        results = [results; row];
+
+        % Quick check message (optional)
+        if abs(ksstat - D_ecdf) > 1e-10
+            warning('%s-%s: ksstat != D_ecdf (%.3e)', vname, dname, abs(ksstat - D_ecdf));
+        end
+    end
+end
+
+%% 6) Print final summary table
+fprintf('\nFinal Table 3 (kstest-ECDF):\n');
+fprintf('%-4s  %-9s  %-10s  %-10s  %-2s  %-10s\n', 'Var', 'Dist', 'D(ksstat)', 'p(kstest)', 'h', 'RMSE');
+fprintf('------------------------------------------------------------\n');
+for i=1:size(results,1)
+    fprintf('%-4s  %-9s  %10.6f  %10.6f  %2d  %10.6f\n', ...
+        results{i,1}, results{i,2}, results{i,3}, results{i,4}, results{i,5}, results{i,10});
+end
+
+%% 7) Optional: show p_fromD comparison
+fprintf('\nCheck: p_fromD (Kolmogorov SF) vs p_kstest\n');
+fprintf('%-4s  %-9s  %-10s  %-10s  %-10s\n', 'Var', 'Dist', 'D', 'p_kstest', 'p_fromD');
+fprintf('------------------------------------------------------------\n');
+for i=1:size(results,1)
+    fprintf('%-4s  %-9s  %10.6f  %10.6f  %10.6f\n', ...
+        results{i,1}, results{i,2}, results{i,8}, results{i,4}, results{i,9});
+end
+
+%% ============================================================
+% Helper: p-value from D and n for one-sample two-sided K–S test
+% p = P(D_n >= D) = 1 - CDF(D)
+% Prefer Matlab's kstwo distribution if available; otherwise fallback.
+%% ============================================================
+function p = ks_pvalue_fromD(D, n)
+    % Guard
+    D = max(0, min(1, D));
+    if D <= 0
+        p = 1;
+        return;
+    elseif D >= 1
+        p = 0;
+        return;
+    end
+
+    % Use built-in Kolmogorov distribution when available (R2019b+ typically)
+    try
+        % kstwo is the distribution of the one-sample two-sided KS statistic
+        % CDF = P(D_n <= x). Survival = 1 - CDF.
+        p = 1 - cdf('kstwo', D, n);
+        % Numerical safety
+        p = max(0, min(1, p));
+        return;
+    catch
+        % Fallback: Stephens-type asymptotic series approximation
+        % lambda = (sqrt(n)+0.12+0.11/sqrt(n))*D
+        % p ≈ 2 * sum_{j=1..∞} (-1)^{j-1} exp(-2 j^2 lambda^2)
+        lambda = (sqrt(n) + 0.12 + 0.11/sqrt(n)) * D;
+        p = 0;
+        for j = 1:200
+            term = 2 * (-1)^(j-1) * exp(-2 * (j^2) * (lambda^2));
+            p = p + term;
+            if abs(term) < 1e-12
+                break;
+            end
+        end
+        % Clamp to [0,1]
+        p = max(0, min(1, p));
+    end
+end
