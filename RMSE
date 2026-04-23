@@ -1,0 +1,232 @@
+%% ============================================================
+%  Fig.2-like composite risk plot (3D slices + 2D contours)
+%  Based on your data (2017–2023 WA/EA/LA) and fitted 3D copula
+%  Copulas tested: Clayton, Gumbel-Houggard, Frank, Ali-Mikhail-Haq
+%  Parameter estimation: theta minimizes RMSE vs empirical copula
+%
+%  Output:
+%   (1) Best copula type, theta, RMSE
+%   (2) 3D slice plot (Fig.2a-like)
+%   (3) 2D contour plots at fixed energy risks 0.2/0.4/0.6 (Fig.2b-d-like)
+%% ============================================================
+
+clear; clc; close all;
+
+%% ------------------ 0) Input data ---------------------------
+Year = (2017:2023)';
+
+WA = [81.98 77.81 75.30 75.80 75.24 69.33 70.63]';                 % 1e8 m^3
+EA = [4688571 4728461 4845262 4942958 5007042 5130603 5229014]';    % kWh
+LA = [5060648 4187159 4675308 3742254 3737991 4217554 4231911]';    % mu
+
+% Optional scaling (recommended for numerical stability only; does NOT change ranks)
+EA = EA / 1e6;   % 10^6 kWh
+LA = LA / 1e6;   % 10^6 mu
+
+n = numel(WA);
+
+%% ------------------ 1) Pseudo-observations -------------------
+% rank/(n+1) is a standard choice to avoid exactly 0 or 1.
+u = tiedrank(WA) / (n+1);
+v = tiedrank(EA) / (n+1);
+w = tiedrank(LA) / (n+1);
+
+% Print pseudo-observations (optional)
+disp(table(Year,u,v,w,'VariableNames',{'Year','u_WA','v_EA','w_LA'}));
+
+%% ------------------ 2) Empirical 3D copula at sample points ---
+% Cn(u_i,v_i,w_i) = (1/n) * sum_{j=1..n} 1(u_j<=u_i, v_j<=v_i, w_j<=w_i)
+Cn = zeros(n,1);
+for i = 1:n
+    Cn(i) = mean( (u <= u(i)) & (v <= v(i)) & (w <= w(i)) );
+end
+
+%% ------------------ 3) Define candidate copulas --------------
+% 3D CDF and 2D CDF are needed for composite risk:
+% p = p1+p2+p3 - C12 - C13 - C23 + C123
+
+% Helper clamps to avoid log(0) etc.
+clip01 = @(x) min(max(x,1e-6),1-1e-6);
+
+% ---------- Clayton ----------
+clayton2 = @(a,b,th) max( (clip01(a).^(-th) + clip01(b).^(-th) - 1).^(-1/th), 0 );
+clayton3 = @(a,b,c,th) max( (clip01(a).^(-th) + clip01(b).^(-th) + clip01(c).^(-th) - 2).^(-1/th), 0 );
+
+% ---------- Gumbel-Houggard ----------
+gumbel2  = @(a,b,th) exp( - ( ((-log(clip01(a))).^th + (-log(clip01(b))).^th).^(1/th) ) );
+gumbel3  = @(a,b,c,th) exp( - ( ((-log(clip01(a))).^th + (-log(clip01(b))).^th + (-log(clip01(c))).^th).^(1/th) ) );
+
+% ---------- Frank (3D: denominator power = d-1 = 2) ----------
+frank2 = @(a,b,th) (-1./th) .* log( 1 + ((exp(-th.*clip01(a))-1).*(exp(-th.*clip01(b))-1)) ./ (exp(-th)-1) );
+frank3 = @(a,b,c,th) (-1./th) .* log( 1 + ((exp(-th.*clip01(a))-1).*(exp(-th.*clip01(b))-1).*(exp(-th.*clip01(c))-1)) ./ (exp(-th)-1).^2 );
+
+% ---------- Ali-Mikhail-Haq ----------
+amh2 = @(a,b,th) (clip01(a).*clip01(b)) ./ (1 - th.*(1-clip01(a)).*(1-clip01(b)));
+amh3 = @(a,b,c,th) (clip01(a).*clip01(b).*clip01(c)) ./ (1 - th.*(1-clip01(a)).*(1-clip01(b)).*(1-clip01(c)));
+
+%% ------------------ 4) Fit theta by minimizing RMSE ----------
+% RMSE(th) = sqrt(mean( (C_th(u,v,w) - Cn).^2 ))
+
+rmse_fun = @(C3, th) sqrt(mean( (C3(u,v,w,th) - Cn).^2 ));
+
+% Store results: {name, theta, rmse}
+fitRes = struct('name',{},'theta',{},'rmse',{});
+
+% ---- Clayton: th > 0 (for positive dependence), use [1e-3, 30]
+objC = @(th) rmse_fun(@(a,b,c,t) clayton3(a,b,c,t), th);
+[thC, rmC] = fminbnd(objC, 1e-3, 30);
+fitRes(end+1) = struct('name','Clayton','theta',thC,'rmse',rmC);
+
+% ---- Gumbel: th >= 1, use [1, 30]
+objG = @(th) rmse_fun(@(a,b,c,t) gumbel3(a,b,c,t), th);
+[thG, rmG] = fminbnd(objG, 1, 30);
+fitRes(end+1) = struct('name','Gumbel-Houggard','theta',thG,'rmse',rmG);
+
+% ---- Frank: th != 0, allow positive and negative; fit both sides and pick best
+objFpos = @(th) rmse_fun(@(a,b,c,t) frank3(a,b,c,t), th);
+[thFp, rmFp] = fminbnd(objFpos, 1e-3, 50);
+objFneg = @(th) rmse_fun(@(a,b,c,t) frank3(a,b,c,t), th);
+[thFn, rmFn] = fminbnd(objFneg, -50, -1e-3);
+if rmFp <= rmFn
+    thF = thFp; rmF = rmFp;
+else
+    thF = thFn; rmF = rmFn;
+end
+fitRes(end+1) = struct('name','Frank','theta',thF,'rmse',rmF);
+
+% ---- AMH: th in [-1,1), to avoid blow-up, restrict to [-0.99, 0.99]
+objA = @(th) rmse_fun(@(a,b,c,t) amh3(a,b,c,t), th);
+[thA, rmA] = fminbnd(objA, -0.99, 0.99);
+fitRes(end+1) = struct('name','Ali-Mikhail-Haq','theta',thA,'rmse',rmA);
+
+% Print fit results
+fprintf('\n===== Copula fitting results (RMSE vs empirical copula) =====\n');
+for k = 1:numel(fitRes)
+    fprintf('%-16s  theta = %+10.6f,  RMSE = %.6f\n', fitRes(k).name, fitRes(k).theta, fitRes(k).rmse);
+end
+
+% Select best (min RMSE)
+[~, idxBest] = min([fitRes.rmse]);
+bestName  = fitRes(idxBest).name;
+bestTheta = fitRes(idxBest).theta;
+bestRMSE  = fitRes(idxBest).rmse;
+
+fprintf('\n>>> Best copula: %s, theta = %.6f, RMSE = %.6f\n\n', bestName, bestTheta, bestRMSE);
+
+%% ------------------ 5) Bind best copula C2/C3 ----------------
+switch bestName
+    case 'Clayton'
+        C2 = @(a,b) clayton2(a,b,bestTheta);
+        C3 = @(a,b,c) clayton3(a,b,c,bestTheta);
+    case 'Gumbel-Houggard'
+        C2 = @(a,b) gumbel2(a,b,bestTheta);
+        C3 = @(a,b,c) gumbel3(a,b,c,bestTheta);
+    case 'Frank'
+        C2 = @(a,b) frank2(a,b,bestTheta);
+        C3 = @(a,b,c) frank3(a,b,c,bestTheta);
+    case 'Ali-Mikhail-Haq'
+        C2 = @(a,b) amh2(a,b,bestTheta);
+        C3 = @(a,b,c) amh3(a,b,c,bestTheta);
+    otherwise
+        error('Unknown best copula.');
+end
+
+% Composite risk for three subsystems (water, energy, food)
+% p = p1+p2+p3 - C12 - C13 - C23 + C123
+compRisk = @(p1,p2,p3) (p1+p2+p3) - C2(p1,p2) - C2(p1,p3) - C2(p2,p3) + C3(p1,p2,p3);
+
+%% ------------------ 6) Create grid of subsystem risks --------
+% Axes in Fig.2 are "shortage risk of available resource" in [0,1]
+step3d = 0.05; % reduce if you want finer slices (e.g., 0.02)
+pW = 0.001:step3d:0.999;
+pE = 0.001:step3d:0.999;
+pF = 0.001:step3d:0.999;
+
+[PW,PE,PF] = meshgrid(pW,pE,pF);
+P = compRisk(PW,PE,PF);
+
+% Enforce probability bounds
+P = min(max(P,0),1);
+
+fprintf('Composite risk P range: min=%.6f, max=%.6f\n', min(P(:)), max(P(:)));
+
+%% ------------------ 7) Fig.2(a)-like 3D GRID surface plot -----
+figure('Color','w','Position',[100 100 820 620]);
+
+% Slice locations (similar to Zhang Fig.2 style: multiple orthogonal planes)
+xs = [0.2 0.4 0.6];
+ys = [0.2 0.4 0.6];
+zs = [0.2 0.4 0.6];
+
+hs = slice(PW,PE,PF,P,xs,ys,zs);
+set(hs, ...
+    'FaceColor','interp', ...
+    'EdgeColor','k', ...        % 黑色边线
+    'LineWidth',0.4, ...        % 线宽（0.3–0.6 最像期刊）
+    'EdgeAlpha',0.6);           % 稍微透明，避免太黑
+
+% Formatting
+xlabel('Water risk','FontName','Times New Roman','FontSize',11);
+ylabel('Energy risk','FontName','Times New Roman','FontSize',11);
+zlabel('Food riak','FontName','Times New Roman','FontSize',11);
+
+title('Composite risk for available water, energy, and food resources', ...
+      'FontName','Times New Roman','FontSize',12,'FontWeight','normal');
+
+grid on; box on;
+view(135,25);
+
+cb = colorbar;
+set(cb,'FontName','Times New Roman','FontSize',10);
+
+colormap(parula); 
+
+
+
+
+
+% IMPORTANT: avoid "single color" saturation.
+% Option A: global probability range
+
+
+% Option B (if you want more contrast): uncomment and tune
+caxis([0.8 1]);
+
+%% ------------------ 8) Fig.2(b-d)-like contour plots ----------
+% Fixed energy shortage risks
+fixedE = [0.2 0.4 0.6];
+
+step2d = 0.01; % contour grid resolution
+[pw2,pf2] = meshgrid(0.001:step2d:0.999, 0.001:step2d:0.999);
+
+figure('Color','w','Position',[120 120 1100 360]);
+
+for i = 1:3
+    peFix = fixedE(i);
+    P2 = compRisk(pw2, peFix*ones(size(pw2)), pf2);
+    P2 = min(max(P2,0),1);
+
+    subplot(1,3,i);
+
+    % Choose contour levels (adjust as needed)
+    levels = 0.1:0.1:0.9;
+    [C,hc] = contour(pw2,pf2,P2,levels,'ShowText','on');
+    hc.LineWidth = 1.0;
+
+    xlabel('Water risk','FontName','Times New Roman','FontSize',10);
+    ylabel('Food risk','FontName','Times New Roman','FontSize',10);
+    title(sprintf('Energy risk = %.1f', peFix), ...
+          'FontName','Times New Roman','FontSize',11,'FontWeight','normal');
+
+    set(gca,'FontName','Times New Roman','FontSize',10);
+    grid on; box on;
+
+    % Optional: keep consistent color scale among subplots
+    colormap(parula);
+end
+
+sgtitle(sprintf('Composite risk contours under fixed energy shortage risks (Best copula: %s, \\theta=%.4f)', ...
+        bestName, bestTheta), 'FontName','Times New Roman','FontSize',12,'FontWeight','normal');
+
+%% ------------------ End of script ----------------------------
+
