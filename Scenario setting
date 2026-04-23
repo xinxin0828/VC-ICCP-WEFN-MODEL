@@ -1,1 +1,47 @@
 
+import numpy as np
+
+# -------------------------------
+# Clayton 3D Copula
+# -------------------------------
+def clayton_copula_3d(u1, u2, u3, theta):
+    return (u1**(-theta) + u2**(-theta) + u3**(-theta) - 2.0) ** (-1.0 / theta)
+
+
+# -------------------------------
+# Solve p2 by bisection
+# -------------------------------
+def solve_p2_bisection(p, p1, p3, theta, tol=1e-8, max_iter=100):
+    u1 = 1 - p1
+    u3 = 1 - p3
+    target = 1 - p
+
+    low, high = 1e-6, 1 - 1e-6
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)   # mid = u2
+        Cmid = clayton_copula_3d(u1, mid, u3, theta)
+
+        if abs(Cmid - target) < tol:
+            break
+        if Cmid > target:
+            high = mid
+        else:
+            low = mid
+
+    u2 = mid
+    return 1 - u2
+
+
+# -------------------------------
+# Example check (your given values)
+# -------------------------------
+theta = 0.7535
+p  = 0.15
+p1 = 0.004
+p3 = 0.05
+
+p2 = solve_p2_bisection(p, p1, p3, theta)
+
+print("Computed p2 =", round(p2, 6))
+
